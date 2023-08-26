@@ -1800,7 +1800,8 @@ class GenericPcapWriter(object):
                       usec=None,  # type: Optional[int]
                       caplen=None,  # type: Optional[int]
                       wirelen=None,  # type: Optional[int]
-                      comment=None  # type: Optional[bytes]
+                      comment=None,  # type: Optional[bytes]
+                      iface_id=0  # type: Optional[int]
                       ):
         # type: (...) -> None
         raise NotImplementedError
@@ -1844,6 +1845,7 @@ class GenericPcapWriter(object):
                      usec=None,  # type: Optional[int]
                      caplen=None,  # type: Optional[int]
                      wirelen=None,  # type: Optional[int]
+                     iface_id=0,  # type: Optional[int]
                      ):
         # type: (...) -> None
         """
@@ -1887,7 +1889,7 @@ class GenericPcapWriter(object):
             rawpkt,
             sec=f_sec, usec=usec,
             caplen=caplen, wirelen=wirelen,
-            comment=comment
+            comment=comment, iface_id=iface_id
         )
 
 
@@ -1920,7 +1922,10 @@ class GenericRawPcapWriter(GenericPcapWriter):
         self.flush()
         self.close()
 
-    def write(self, pkt):
+    def _check_linktype(self, p, iface_id):
+        return self.linktype != conf.l2types.get(type(p), None)
+
+    def write(self, pkt, iface_id=0):
         # type: (Union[_PacketIterable, bytes]) -> None
         """
         Writes a Packet, a SndRcvList object, or bytes to a pcap file.
@@ -1941,13 +1946,13 @@ class GenericRawPcapWriter(GenericPcapWriter):
                     self.write_header(p)
 
                 if not isinstance(p, bytes) and \
-                        self.linktype != conf.l2types.get(type(p), None):
+                        self._check_linktype(p, iface_id):
                     warning("Inconsistent linktypes detected!"
                             " The resulting file might contain"
                             " invalid packets."
                             )
 
-                self.write_packet(p)
+                self.write_packet(p, iface_id=iface_id)
 
 
 class RawPcapWriter(GenericRawPcapWriter):
@@ -2037,7 +2042,8 @@ class RawPcapWriter(GenericRawPcapWriter):
                       usec=None,  # type: Optional[int]
                       caplen=None,  # type: Optional[int]
                       wirelen=None,  # type: Optional[int]
-                      comment=None  # type: Optional[bytes]
+                      comment=None, # type: Optional[bytes]
+                      iface_id=0  # type: Optional[int]
                       ):
         # type: (...) -> None
         """
@@ -2060,6 +2066,9 @@ class RawPcapWriter(GenericRawPcapWriter):
         :return: None
         :rtype: None
         """
+
+        # iface_id != 0 is being ignored for now
+
         if caplen is None:
             caplen = len(packet)
         if wirelen is None:
@@ -2081,6 +2090,17 @@ class RawPcapWriter(GenericRawPcapWriter):
             self.f.flush()
 
 
+class RawPcapNgInterface:
+    """A representation of the interface in PcapNg"""
+
+    def __init__(self, interface_id, linktype=DLT_EN10MB, name=None):
+        self.interface_id = interface_id
+        self.name = name
+        self.linktype = linktype
+
+        self.idb_present = False
+
+
 class RawPcapNgWriter(GenericRawPcapWriter):
     """A stream pcapng writer with more control than wrpcapng()"""
 
@@ -2089,9 +2109,12 @@ class RawPcapNgWriter(GenericRawPcapWriter):
                  ):
         # type: (...) -> None
 
+        self.interfaces = {}
+        self.__current_iface_id__ = 0
+
         self.header_present = False
         self.tsresol = 1000000
-        self.linktype = DLT_EN10MB
+        #self.linktype = DLT_EN10MB
 
         # tcpdump only support little-endian in PCAPng files
         self.endian = "<"
@@ -2099,6 +2122,16 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
         self.filename = filename
         self.f = open(filename, "wb", 4096)
+
+    def create_interface(self, linktype=DLT_EN10MB, name=None):
+        # type: (Optional[int], Optional[str]) -> int
+
+        iface_id = self.__current_iface_id__
+        self.__current_iface_id__ += 1
+
+        self.interfaces[iface_id] = RawPcapNgInterface(iface_id, linktype=linktype, name=name)
+
+        return iface_id
 
     def _get_time(self,
                   packet,  # type: Union[bytes, Packet]
@@ -2119,6 +2152,14 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         # type: (bytes) -> bytes
         raw_data += ((-len(raw_data)) % 4) * b"\x00"
         return raw_data
+
+    def _check_linktype(self, p, iface_id):
+        if iface_id not in self.interfaces.keys():
+            return False
+
+        iface = self.interfaces[iface_id]
+
+        return iface.linktype != conf.l2types.get(type(p), None)
 
     def build_block(self, block_type, block_body, options=None):
         # type: (bytes, bytes, Optional[bytes]) -> bytes
@@ -2143,12 +2184,17 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
         return block
 
+    def _write_all_unwritten_idbs(self):
+        for iface_id in sorted(self.interfaces.keys()):
+            self._write_idb_for_interface(iface_id)
+
     def _write_header(self, pkt):
-        # type: (Optional[Union[Packet, bytes]]) -> None
+        # type: (Optional[Union[Packet, bytes]], Optional[int]) -> None
         if not self.header_present:
             self.header_present = True
             self._write_block_shb()
-            self._write_block_idb()
+
+        self._write_all_unwritten_idbs()
 
     def _write_block_shb(self):
         # type: () -> None
@@ -2166,17 +2212,37 @@ class RawPcapNgWriter(GenericRawPcapWriter):
 
         self.f.write(self.build_block(block_type, block_shb))
 
-    def _write_block_idb(self):
+    def _idb_written(self, iface_id):
+        if iface_id not in self.interfaces.keys():
+            return False
+
+        iface = self.interfaces[iface_id]
+
+        return iface.idb_present
+
+    def _write_idb_for_interface(self, iface_id):
+        iface = self.interfaces[iface_id]
+
+        if not iface.idb_present:
+            self._write_block_idb(iface.linktype, name=iface.name)
+            iface.idb_present = True
+
+    def _write_block_idb(self, linktype, snaplen=262144, name=None):
         # type: () -> None
 
         # Block Type
         block_type = struct.pack(self.endian + "I", 1)
         # LinkType
-        block_idb = struct.pack(self.endian + "H", self.linktype)
+        block_idb = struct.pack(self.endian + "H", linktype)
         # Reserved
         block_idb += struct.pack(self.endian + "H", 0)
         # SnapLen
-        block_idb += struct.pack(self.endian + "I", 262144)
+        block_idb += struct.pack(self.endian + "I", snaplen)
+
+        # Add Interface Name Option (2), if name exists
+        if name is not None:
+            block_idb += struct.pack(self.endian + "HH", 0x0002, len(name))
+            block_idb += name.encode()
 
         self.f.write(self.build_block(block_type, block_idb))
 
@@ -2197,7 +2263,8 @@ class RawPcapNgWriter(GenericRawPcapWriter):
                          timestamp=None,  # type: Optional[Union[EDecimal, float]]  # noqa: E501
                          caplen=None,  # type: Optional[int]
                          orglen=None,  # type: Optional[int]
-                         comment=None  # type: Optional[bytes]
+                         comment=None,  # type: Optional[bytes]
+                         iface_id=0  # type: Optional[int]
                          ):
         # type: (...) -> None
 
@@ -2217,7 +2284,7 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         # Block Type
         block_type = struct.pack(self.endian + "I", 6)
         # Interface ID
-        block_epb = struct.pack(self.endian + "I", 0)
+        block_epb = struct.pack(self.endian + "I", iface_id)
         # Timestamp (High)
         block_epb += struct.pack(self.endian + "I", ts_high)
         # Timestamp (Low)
@@ -2248,7 +2315,8 @@ class RawPcapNgWriter(GenericRawPcapWriter):
                       usec=None,  # type: Optional[int]
                       caplen=None,  # type: Optional[int]
                       wirelen=None,  # type: Optional[int]
-                      comment=None  # type: Optional[bytes]
+                      comment=None,  # type: Optional[bytes]
+                      iface_id=0  # type: Optional[int]
                       ):
         # type: (...) -> None
         """
@@ -2273,8 +2341,14 @@ class RawPcapNgWriter(GenericRawPcapWriter):
         if wirelen is None:
             wirelen = caplen
 
+        # check if the default interface 0 is present
+        if iface_id == 0 and iface_id not in self.interfaces:
+            self.create_interface()
+
+        self._write_all_unwritten_idbs()
+
         self._write_block_epb(packet, timestamp=sec, caplen=caplen,
-                              orglen=wirelen, comment=comment)
+                              orglen=wirelen, comment=comment, iface_id=iface_id)
         if self.sync:
             self.f.flush()
 
